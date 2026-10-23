@@ -90,14 +90,20 @@ def main():
     parser.add_argument('--iterations', type=int, default=25)
     parser.add_argument(
         '--mode',
-        choices=['field', 'length', 'byteflip', 'blind', 'combined', 'full'],
+        choices=['ai', 'field', 'length', 'byteflip', 'blind', 'combined', 'full'],
         default='field',
+    )
+    parser.add_argument(
+        '--ai',
+        action='store_true',
+        help='Balance applicable fuzzing strategies automatically',
     )
     parser.add_argument(
         '--field',
         choices=['opcode', 'flags', 'request_id'],
-        default='request_id',
+        default=None,
     )
+    parser.add_argument('--fuzz-count', type=int)
     parser.add_argument('--seed', type=int)
     parser.add_argument('--timeout', type=float, default=1.0)
     args = parser.parse_args()
@@ -106,6 +112,12 @@ def main():
         parser.error('--iterations must be at least 1')
     if args.timeout <= 0:
         parser.error('--timeout must be positive')
+    if args.fuzz_count is not None and args.fuzz_count < 0:
+        parser.error('--fuzz-count cannot be negative')
+    if args.ai and args.mode not in {'field', 'ai'}:
+        parser.error('--ai cannot be combined with a manually selected mode')
+
+    campaign_mode = 'ai' if args.ai else args.mode
 
     framework = Framework(verbose=False, seed=args.seed)
     values = {
@@ -133,19 +145,22 @@ def main():
     for case_number in range(1, args.iterations + 1):
         target_fields = None
         fuzz_count = None
-        if args.mode in structured_modes:
-            target_fields = [args.field]
-            fuzz_count = 1
-        elif args.mode == 'length':
-            fuzz_count = 1
+        if campaign_mode in structured_modes:
+            target_fields = [args.field or 'request_id']
+            fuzz_count = args.fuzz_count if args.fuzz_count is not None else 1
+        elif campaign_mode == 'length':
+            fuzz_count = args.fuzz_count if args.fuzz_count is not None else 1
+        elif campaign_mode == 'ai':
+            target_fields = [args.field] if args.field else None
+            fuzz_count = args.fuzz_count
 
         packet, info = framework.build(
             BinaryRequest,
-            mode=args.mode,
+            mode=campaign_mode,
             values=values,
             fields=target_fields,
             fuzz_count=fuzz_count,
-            byteflip_count=1 if args.mode in byteflip_modes else None,
+            byteflip_count=1 if campaign_mode in byteflip_modes else None,
         )
 
         try:
@@ -157,10 +172,14 @@ def main():
         strategies = [mutation.strategy for mutation in info.mutations]
         if info.byteflips:
             strategies.append('byteflip')
+        mode_label = info.mode.value
+        if info.requested_mode is not None:
+            mode_label = '{}->{}'.format(info.requested_mode.value, mode_label)
         print(
-            '[{:03d}] seed={} size={} mutations={} response={}'.format(
+            '[{:03d}] seed={} mode={} size={} mutations={} response={}'.format(
                 case_number,
                 info.seed,
+                mode_label,
                 len(packet),
                 ','.join(strategies) or 'none',
                 result,

@@ -27,6 +27,7 @@ Use OffByWon only against systems for which you have authorization to test.
 - [Relationships and nested values](#relationships-and-nested-values)
 - [Structured mutation values](#structured-mutation-values)
 - [Fuzzing modes](#fuzzing-modes)
+- [AI-specific usage](#ai-specific-usage)
 - [Field selection and mutation counts](#field-selection-and-mutation-counts)
 - [Reproducibility and mutation metadata](#reproducibility-and-mutation-metadata)
 - [Framework API](#framework-api)
@@ -259,6 +260,15 @@ To exercise the declared payload-length relationship instead, run:
 ```console
 python3 -m examples.binary_quickstart_fuzzer --mode length --iterations 25
 ```
+
+To let OffByWon balance the applicable mutation strategies automatically, run:
+
+```console
+python3 -m examples.binary_quickstart_fuzzer --ai --iterations 25
+```
+
+AI mode mutates one structured field by default. Use `--fuzz-count N` to raise
+that per-packet structured-field limit.
 
 The program first requires a valid binary response to the clean request. It
 then prints the seed, packet size, mutation strategy, decoded status, echoed
@@ -520,6 +530,7 @@ element. DER and NDR use format-specific mutations described below.
 | Mode | Operation |
 | --- | --- |
 | `clean` | Serialize without mutation. |
+| `ai` | Select one applicable concrete strategy for each build using coverage-balanced scheduling. Structured strategies mutate one field by default. |
 | `field` | Mutate selected logical fields according to their type. `STRUCT` and `PADDING` are not directly selected; nested fields may be selected. |
 | `length` | Automatically select only `LENGTH`, `COUNT`, and `OFFSET` relation fields and emit mismatches. A native integer relation can be selected explicitly. |
 | `array` | Select `ARRAY` and `COUNT` fields. Arrays insert, remove, or duplicate elements; `array_expand=True` permits boundary-sized expansion up to `array_max`. |
@@ -538,10 +549,201 @@ Blind mode applies one packet-level transformation per build. It does not use
 `fields`, `fuzz_count`, or `byteflip_count`; those controls apply to the mode
 components described above.
 
+## AI-specific usage
+
+This section is written for AI agents that generate, launch, or supervise an
+OffByWon campaign. Unless a human has requested a particular mutation strategy,
+an AI should enable automatic mode with `--ai`. In framework code, the
+equivalent setting is `mode='ai'`.
+
+The core package is transport-independent and does not impose one campaign
+command line. A protocol fuzzer built with OffByWon should expose `--ai` and
+map it directly to the framework mode:
+
+```python
+parser.add_argument(
+    '--ai',
+    action='store_true',
+    help='Balance applicable fuzzing strategies automatically',
+)
+args = parser.parse_args()
+
+mode = 'ai' if args.ai else 'field'
+packet, info = framework.build(
+    Message,
+    mode=mode,
+    values=runtime_values,
+)
+```
+
+The included binary quickstart implements that convention:
+
+```console
+python3 -m examples.binary_quickstart_fuzzer --ai --iterations 100
+```
+
+An AI using the framework API directly should request the same policy on every
+fuzzing round:
+
+```python
+framework = Framework(verbose=False, seed=campaign_seed)
+
+for case_number in range(iterations):
+    packet, info = framework.build(
+        Message,
+        mode='ai',
+        values=runtime_values,
+    )
+    result = exchange(packet)
+```
+
+### Why an AI should use `--ai`
+
+An autonomous client often lacks enough protocol-specific evidence to choose
+one mutation family in advance. Automatic mode provides the broadest balanced
+strategy coverage available from OffByWon without external target
+instrumentation:
+
+- The framework considers `field`, `length`, `array`, `byteflip`, `blind`,
+  `combined`, and `full`.
+- It excludes structured strategies that cannot mutate the declared packet or
+  the explicitly requested fields.
+- It chooses among the least-used eligible strategies on every build. Ties are
+  randomized, so every eligible strategy is exercised before one is repeatedly
+  favored.
+- It selects one structured field by default. This keeps individual cases
+  attributable and reproducible while the campaign rotates through different
+  mutation families.
+- Each result records the requested mode, concrete selected mode, mutations,
+  byteflips, packet sizes, and case seed.
+
+Selecting one fixed mode for the whole campaign concentrates testing on one
+mutation surface. For example, a blind-only campaign may never exercise valid
+deeply parsed messages, while a field-only campaign does not test raw packet
+handling. Automatic mode covers both classes and the available composite and
+relationship strategies.
+
+This is strategy coverage, not feedback-guided code coverage. OffByWon does not
+receive branch, edge, sanitizer, or process-state feedback from the target. An
+AI must not claim that `--ai` maximized executed target code unless a separate
+instrumentation system provides that evidence.
+
+### Recommended AI workflow
+
+1. Confirm that the target is authorized and identify its transport, protocol
+   state, authentication requirements, and valid runtime field values.
+2. Build and exchange a clean packet with `Framework.build_clean()`. Do not
+   begin fuzzing until the target accepts the baseline.
+3. Start an independent process, journal, sanitizer, debugger, or service-health
+   monitor on the target. A timeout or missing response alone is not proof of a
+   crash.
+4. Launch the protocol fuzzer with `--ai`, or call
+   `Framework.build(mode='ai')` for every fuzzing round.
+5. Start with the default one-field budget. Increase `fuzz_count` only when the
+   campaign requires multi-field interactions.
+6. Record the final packet bytes, concrete strategy, case seed, response, and
+   target-side evidence for every suspected failure.
+7. Reproduce a candidate with its concrete mode and seed before changing the
+   campaign configuration.
+
+A minimal baseline-first loop is:
+
+```python
+framework = Framework(verbose=False, seed=campaign_seed)
+
+clean = framework.build_clean(Message, runtime_values)
+baseline = exchange(clean)
+if not valid_baseline(baseline):
+    raise RuntimeError('clean baseline failed')
+
+for case_number in range(iterations):
+    packet, info = framework.build(
+        Message,
+        mode='ai',
+        values=runtime_values,
+    )
+    response = exchange(packet)
+    record_case(case_number, packet, info, response)
+```
+
+Target monitoring and crash confirmation remain responsibilities of the
+campaign runner. The framework produces packets and mutation metadata; it does
+not prove that a target process crashed.
+
+### Mutation budgets in AI mode
+
+AI mode defaults to at most one structured field and one byteflip when the
+selected concrete strategy contains those components:
+
+```python
+packet, info = framework.build(
+    Message,
+    mode='ai',
+    fuzz_count=1,
+    byteflip_count=1,
+)
+```
+
+`fuzz_count` limits structured field mutations only. Composite strategies can
+still perform additional operations:
+
+- `combined` applies structured mutation followed by byteflips;
+- `full` applies structured mutation, byteflips, and one blind transformation;
+- `blind` performs one packet-level transformation and ignores
+  `fuzz_count`;
+- `byteflip` performs no structured field mutation.
+
+A protocol fuzzer that exposes the framework controls should keep the budgets
+independent:
+
+```console
+python3 your_protocol_fuzzer.py \
+  --ai \
+  --fuzz-count 3 \
+  --byteflip-count 1
+```
+
+This requests up to three structured fields when a structured strategy is
+selected and one byteflip when a byteflip component is selected. `--ai` should
+be mutually exclusive with CLI switches that force a particular strategy,
+because automatic mode makes that selection for every packet.
+
+### Recording and replaying AI-generated cases
+
+In AI mode, `FuzzInfo.requested_mode` is `FuzzMode.AI` and `FuzzInfo.mode`
+is the concrete strategy used for that packet:
+
+```python
+record = {
+    'requested_mode': info.requested_mode.value,
+    'concrete_mode': info.mode.value,
+    'seed': info.seed,
+    'packet_hex': packet.hex(),
+}
+```
+
+Replay one case with the recorded concrete mode, not with a fresh automatic
+selection:
+
+```python
+replayed, replay_info = framework.build(
+    Message,
+    mode=info.mode,
+    values=runtime_values,
+    seed=info.seed,
+)
+assert replayed == packet
+```
+
+A complete automatic campaign is reproducible when a fresh `Framework` uses
+the same constructor seed and receives the same sequence of build calls. Store
+the final bytes as well as the seed because later packet-definition or
+framework changes can alter seed-based generation.
+
 ## Field selection and mutation counts
 
 The selection controls apply to structured modes (`field`, `length`, `array`,
-`combined`, and `full`):
+`combined`, and `full`) and to the structured component selected by `ai`:
 
 ```python
 data, info = framework.build(
@@ -553,7 +755,8 @@ data, info = framework.build(
 ```
 
 - With neither `fields` nor `fuzz_count`, `Framework` selects between one and
-  five eligible fields, limited by the number available.
+  five eligible fields, limited by the number available. AI mode is the
+  exception: it selects one eligible field by default.
 - `fields` restricts selection to the named fields. Unknown or ineligible names
   raise `ValueError`.
 - `fuzz_count` is the maximum number of structured fields selected in one
@@ -583,10 +786,18 @@ byteflip component.
 
 Each call to `Framework.build()` uses a case seed and returns it in
 `FuzzInfo.seed`. Passing that seed to another build with the same packet class,
-mode, and values reproduces field selection and generated mutation values.
+concrete mode, and values reproduces field selection and generated mutation
+values.
 
 `Framework(seed=...)` produces a reproducible sequence of case seeds. The
 per-build `seed=` argument reproduces one exact case.
+
+For AI mode, `FuzzInfo.mode` is the concrete strategy selected for the case and
+`FuzzInfo.requested_mode` is `FuzzMode.AI`. Reproduce one AI-generated case by
+passing `mode=info.mode` and `seed=info.seed`. Replaying with `mode='ai'`
+instead also depends on the scheduler's preceding strategy counts. Two fresh
+frameworks constructed with the same seed and called in the same order produce
+the same complete AI campaign sequence.
 
 ```python
 from typing import List, Optional
@@ -602,6 +813,7 @@ class FuzzInfo:
     original_size: int
     fuzzed_size: int
     seed: Optional[int]
+    requested_mode: Optional[FuzzMode]
 ```
 
 A `Mutation` records the field path, original value, generated value, strategy,
@@ -776,11 +988,7 @@ Install the development dependencies and run the core framework suite:
 
 ```console
 python3 -m pip install -e '.[dev]'
-python3 -m pytest -q \
-  tests/test_framework.py \
-  tests/test_serialization_matrix.py \
-  tests/test_der_matrix.py \
-  tests/test_regressions.py
+python3 -m pytest -q
 ```
 
 ## Framework source layout
@@ -793,13 +1001,16 @@ offbywon/                         core package
   framework.py                   build orchestration and mutation metadata
   der.py                         DER encoders, mutations, and protocol helpers
 tests/
+  test_ai_mode.py                AI strategy scheduling and budgets
   test_framework.py              primary framework behavior
+  test_quic_fuzzer.py            QUIC mode and mutation-budget behavior
   test_serialization_matrix.py   field serialization matrix
   test_der_matrix.py             DER serialization and mutation behavior
   test_regressions.py            framework regression tests
 examples/
   binary_quickstart_fuzzer.py    minimal baseline-first binary TCP fuzzer
   binary_quickstart_server.py    local reference target for the quickstart
+  quic_initial_fuzzer.py         QUIC Initial integration with --ai mode
 ```
 
 ## License and author

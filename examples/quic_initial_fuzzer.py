@@ -72,6 +72,9 @@ Usage:
     python3 quic_initial_fuzzer.py -s ::1 -p 4433 --combined \
         --fuzz-target all --fuzz-count 1 --byteflip-count 1
 
+    # AI-oriented mode: balance strategies automatically on every packet
+    python3 quic_initial_fuzzer.py -s ::1 -p 4433 --ai --fuzz-target all
+
     # Blind byte corruption of the final datagram (tests the AEAD gate itself)
     python3 quic_initial_fuzzer.py -s ::1 -p 4433 --blind
 """
@@ -389,6 +392,8 @@ class QUICInitialFuzzer:
     correct RFC 9001 packet protection so mutations reach the real parsers.
     """
 
+    AI_STRATEGIES = ('field', 'length', 'byteflip', 'blind', 'combined', 'full')
+
     def __init__(self):
         self.fw = Framework(verbose=False, color=True)
 
@@ -411,6 +416,7 @@ class QUICInitialFuzzer:
         self.fuzz_mode: str = 'field'
         self.fuzz_count: Optional[int] = None
         self.byteflip_count: int = 1
+        self.ai_mode: bool = False
         self.blind_mode: bool = False
         self.combined_mode: bool = False
         self.byteflip_mode: bool = False
@@ -431,6 +437,7 @@ class QUICInitialFuzzer:
         self._start_time: float = 0.0
         self._last_status: float = 0.0
         self._target_counts: Dict[str, int] = {}
+        self._mode_counts: Dict[str, int] = {}
         self._status_active: bool = False  # a \r status line is currently on screen
 
         # Output tracking (OffByWon standardized format)
@@ -534,7 +541,8 @@ class QUICInitialFuzzer:
             sys.stdout.flush()
             self._status_active = False
 
-    def _status_line(self, target: str, last_resp: int, force: bool = False):
+    def _status_line(self, target: str, last_resp: int, force: bool = False,
+                     mode: str = None):
         """
         Live, in-place progress line (carriage-return updated) so a long run is
         never a black box. Throttled to ~5 Hz. Shows rate, counts, current
@@ -551,10 +559,12 @@ class QUICInitialFuzzer:
         spread = " ".join(f"{t[:4]}={self._target_counts.get(t, 0)}"
                           for t in self.get_available_targets())
         GREEN = '\033[92m'; CYAN = '\033[96m'; YELLOW = '\033[93m'; RESET = '\033[0m'
+        active_mode = mode or self.fuzz_mode
+        current = f"{active_mode}/{target}" if target else active_mode
         line = (f"\r{CYAN}[fuzz]{RESET} #{self.packet_count} "
                 f"{GREEN}{rate:6.0f}/s{RESET} "
                 f"resp={self.response_count} crash={self.crash_count} "
-                f"now={YELLOW}{target or 'clean'}{RESET} | {spread}")
+                f"now={YELLOW}{current}{RESET} | {spread}")
         sys.stdout.write(line + "\033[K")
         sys.stdout.flush()
         self._status_active = True
@@ -1098,6 +1108,7 @@ Examples:
   %(prog)s -s ::1 -p 4433 -f --fuzz-len --fuzz-target crypto_frame
   %(prog)s -s ::1 -p 4433 -f --fuzz-target tls
   %(prog)s -s ::1 -p 4433 -f --combined --fuzz-target all
+  %(prog)s -s ::1 -p 4433 --ai --fuzz-target all
 """)
         tg = parser.add_argument_group('Target')
         tg.add_argument("-s", "--server", help="QUIC server hostname or IP")
@@ -1117,10 +1128,12 @@ Examples:
                         help=f"Target: {', '.join(self.get_available_targets())} or 'all'")
         fg.add_argument(
             "--fuzz-count", type=int, default=None,
-            help="Maximum structured fields per packet",
+            help="Maximum structured fields per packet (AI default: 1)",
         )
         fg.add_argument("--byteflip-count", type=int, default=None,
                         help="Final-datagram byteflips (default: --fuzz-count when set, otherwise 1)")
+        fg.add_argument("--ai", action="store_true",
+                        help="Automatically balance fuzzing strategies on every packet")
         fg.add_argument("--blind", action="store_true", help="Blind datagram corruption")
         fg.add_argument("--combined", action="store_true",
                         help="Structured fuzzing plus final-datagram byteflips")
@@ -1156,6 +1169,9 @@ Examples:
             parser.error("--fuzz-count cannot be negative")
         if p.byteflip_count is not None and p.byteflip_count < 0:
             parser.error("--byteflip-count cannot be negative")
+        if p.ai and any((p.blind, p.combined, p.byteflip, p.fuzz_len)):
+            parser.error("--ai selects strategies automatically; do not combine it with "
+                         "--blind, --combined, --byteflip, or --fuzz-len")
 
         self.host = p.server
         self.port = p.port
@@ -1167,13 +1183,14 @@ Examples:
 
         self.fuzzing = p.fuzz
         self.fuzz_targets = [p.fuzz_target] if p.fuzz_target != 'all' else ['all']
-        self.fuzz_count = p.fuzz_count
+        self.fuzz_count = 1 if p.ai and p.fuzz_count is None else p.fuzz_count
         if p.byteflip_count is not None:
             self.byteflip_count = p.byteflip_count
         elif p.fuzz_count is not None:
             self.byteflip_count = p.fuzz_count
         else:
             self.byteflip_count = 1
+        self.ai_mode = p.ai
         self.blind_mode = p.blind
         self.combined_mode = p.combined
         self.byteflip_mode = p.byteflip
@@ -1188,6 +1205,8 @@ Examples:
 
         if self.dry_run:
             self.fuzz_mode = 'clean'
+        elif self.ai_mode:
+            self.fuzz_mode = 'ai'
         elif self.blind_mode:
             self.fuzz_mode = 'blind'
         elif self.combined_mode:
@@ -1251,12 +1270,29 @@ Examples:
     # MAIN RUN LOOP
     # =========================================================================
 
-    def select_target(self) -> Optional[str]:
+    def select_round_mode(self) -> str:
+        """Resolve the concrete mutation strategy for the next packet."""
+        if self.fuzz_mode != 'ai':
+            return self.fuzz_mode
+        return self.fw.choose_ai_mode(self.AI_STRATEGIES).value
+
+    def select_target(self, mode: str = None) -> Optional[str]:
         # Blind and byteflip modes mutate only the final datagram. Structured
         # targets apply to field, length, combined, and full modes.
-        if self.dry_run or self.fuzz_mode not in ('field', 'length', 'combined', 'full'):
+        effective_mode = mode or self.fuzz_mode
+        if self.dry_run or effective_mode not in ('field', 'length', 'combined', 'full'):
             return None
         if 'all' in self.fuzz_targets:
+            if self.fuzz_mode == 'ai':
+                minimum = min(
+                    self._target_counts.get(target, 0)
+                    for target in self.get_available_targets()
+                )
+                least_used = [
+                    target for target in self.get_available_targets()
+                    if self._target_counts.get(target, 0) == minimum
+                ]
+                return random.choice(least_used)
             return random.choice(self.get_available_targets())
         return self.fuzz_targets[0]
 
@@ -1270,12 +1306,16 @@ Examples:
         print(f"[*] Target:     {self.host}:{self.port} (UDP)")
         print(f"[*] QUIC ver:   0x{self.version:08x}")
         print(f"[*] ALPN:       {self.alpn.decode(errors='replace')}  SNI: {self.server_name}")
-        print(f"[*] Mode:       {self.fuzz_mode}")
+        if self.fuzz_mode == 'ai':
+            print("[*] Mode:       ai (automatic strategy selection per packet)")
+            print(f"[*] Strategies: {', '.join(self.AI_STRATEGIES)}")
+        else:
+            print(f"[*] Mode:       {self.fuzz_mode}")
         print(f"[*] Targets:    {', '.join(self.fuzz_targets)}")
-        if self.fuzz_mode in ('field', 'length', 'combined', 'full'):
+        if self.fuzz_mode in ('ai', 'field', 'length', 'combined', 'full'):
             structured_count = self.fuzz_count if self.fuzz_count is not None else 'auto (1-5)'
             print(f"[*] Structured: {structured_count} field(s) per packet")
-        if self.fuzz_mode in ('byteflip', 'combined', 'full'):
+        if self.fuzz_mode in ('ai', 'byteflip', 'combined', 'full'):
             print(f"[*] Byteflips:  {self.byteflip_count} per packet")
         print(f"[*] Iterations: {'infinite (Ctrl+C to stop)' if self.iterations is None else self.iterations}")
         print()
@@ -1326,19 +1366,26 @@ Examples:
         try:
             i = 0
             while self.iterations is None or i < self.iterations:
-                target = self.select_target()
+                round_mode = self.select_round_mode()
+                target = self.select_target(round_mode)
                 try:
-                    packet = self.build_packet(fuzz_target=target, mode=self.fuzz_mode)
+                    packet = self.build_packet(fuzz_target=target, mode=round_mode)
                     self.packet_count += 1
-                    self._target_counts[target or 'clean'] = \
-                        self._target_counts.get(target or 'clean', 0) + 1
+                    self._mode_counts[round_mode] = self._mode_counts.get(round_mode, 0) + 1
+                    target_key = target or f'<{round_mode}>'
+                    self._target_counts[target_key] = self._target_counts.get(target_key, 0) + 1
 
                     # Full packet block: first few + every print_every, plus -v.
                     if self.verbose or self.packet_count <= 3 or \
                             (self.print_every and self.packet_count % self.print_every == 0):
                         self._clear_status()
-                        self._print_packet_output(f"QUIC-Initial[{target or 'clean'}]",
-                                                  self.fuzz_mode, packet)
+                        display_mode = (f"ai -> {round_mode}"
+                                        if self.fuzz_mode == 'ai' else round_mode)
+                        self._print_packet_output(
+                            f"QUIC-Initial[{target or round_mode}]",
+                            display_mode,
+                            packet,
+                        )
 
                     last_resp = self.fuzz_send(packet)
                     self.response_count += last_resp
@@ -1358,7 +1405,7 @@ Examples:
                         else:
                             self.consecutive_dead = 0
 
-                    self._status_line(target, last_resp)
+                    self._status_line(target, last_resp, mode=round_mode)
                     i += 1
 
                 except ConnectionRefusedError:
@@ -1393,6 +1440,9 @@ Examples:
         if self._target_counts:
             spread = "  ".join(f"{t}={n}" for t, n in sorted(self._target_counts.items()))
             print(f"[*] Target spread:     {spread}")
+        if self._mode_counts:
+            spread = "  ".join(f"{m}={n}" for m, n in sorted(self._mode_counts.items()))
+            print(f"[*] Strategy spread:   {spread}")
 
 
 def main():

@@ -130,6 +130,69 @@ def test_cli_combined_mode_defaults_to_one_byteflip():
     assert fuzzer.byteflip_count == 1
 
 
+def test_cli_ai_mode_defaults_to_one_mutation_per_component():
+    fuzzer = QUICInitialFuzzer()
+    fuzzer.parse_arguments([
+        "-s", "127.0.0.1",
+        "--ai",
+        "--fuzz-target", "tls",
+    ])
+
+    assert fuzzer.fuzz_mode == "ai"
+    assert fuzzer.fuzz_count == 1
+    assert fuzzer.byteflip_count == 1
+
+
+def test_ai_mode_balances_every_quic_strategy_before_repeating():
+    fuzzer = QUICInitialFuzzer()
+    fuzzer.parse_arguments([
+        "-s", "127.0.0.1",
+        "--ai",
+        "--fuzz-target", "tls",
+    ])
+
+    selected = [fuzzer.select_round_mode() for _ in fuzzer.AI_STRATEGIES]
+
+    assert set(selected) == set(fuzzer.AI_STRATEGIES)
+
+
+def test_ai_mode_builds_each_strategy_with_the_expected_budget():
+    fuzzer = QUICInitialFuzzer()
+    fuzzer.parse_arguments([
+        "-s", "127.0.0.1",
+        "--ai",
+        "--fuzz-target", "tls",
+    ])
+
+    for _ in fuzzer.AI_STRATEGIES:
+        mode = fuzzer.select_round_mode()
+        target = fuzzer.select_target(mode)
+        fuzzer.build_packet(fuzz_target=target, mode=mode)
+
+        structured = [
+            mutation for mutation in fuzzer._current_mutations
+            if mutation[0] != '<packet>'
+        ]
+        if mode in {'field', 'length', 'combined', 'full'}:
+            assert len(structured) == 1
+        else:
+            assert structured == []
+        if mode in {'byteflip', 'combined', 'full'}:
+            assert len(fuzzer._current_byteflips) == 1
+        else:
+            assert fuzzer._current_byteflips == []
+
+
+@pytest.mark.parametrize('other_mode', [
+    '--blind', '--combined', '--byteflip', '--fuzz-len',
+])
+def test_cli_ai_mode_rejects_manual_strategy_switches(other_mode):
+    with pytest.raises(SystemExit):
+        QUICInitialFuzzer().parse_arguments([
+            "-s", "127.0.0.1", "--ai", other_mode,
+        ])
+
+
 @pytest.mark.parametrize("option", ["--fuzz-count", "--byteflip-count"])
 def test_cli_rejects_negative_mutation_counts(option):
     with pytest.raises(SystemExit):

@@ -33,6 +33,16 @@ class Framework:
         data, info = fw.build(MyPacket, mode='combined', values={'session_id': 123})
         sock.send(data)
     """
+
+    AI_STRATEGIES = (
+        FuzzMode.FIELD,
+        FuzzMode.LENGTH,
+        FuzzMode.ARRAY,
+        FuzzMode.BYTEFLIP,
+        FuzzMode.BLIND,
+        FuzzMode.COMBINED,
+        FuzzMode.FULL,
+    )
     
     def __init__(self, verbose: bool = True, color: bool = True,
                  seed: int = None, rng=None):
@@ -54,6 +64,38 @@ class Framework:
         self.packet_count = 0
         self.serializer = Serializer()
         self._rng = rng if rng is not None else random.Random(seed)
+        self._ai_mode_counts = {mode: 0 for mode in self.AI_STRATEGIES}
+
+    def choose_ai_mode(self, available_modes=None, rng=None) -> FuzzMode:
+        """Choose the least-used available strategy for balanced coverage.
+
+        Ties are randomized. Consequently every available strategy is chosen
+        once before any strategy is chosen a second time. Supplying a seeded
+        framework makes the tie order reproducible.
+        """
+        candidates = self.AI_STRATEGIES if available_modes is None else available_modes
+        normalized = []
+        for candidate in candidates:
+            if isinstance(candidate, str):
+                candidate = FuzzMode(candidate)
+            elif not isinstance(candidate, FuzzMode):
+                raise TypeError("AI strategies must be FuzzMode values or valid mode strings")
+            if candidate in (FuzzMode.CLEAN, FuzzMode.AI):
+                raise ValueError("AI strategy candidates cannot include 'clean' or 'ai'")
+            if candidate not in normalized:
+                normalized.append(candidate)
+        if not normalized:
+            raise ValueError("at least one AI strategy candidate is required")
+
+        rng = rng if rng is not None else self._rng
+        minimum = min(self._ai_mode_counts.get(mode, 0) for mode in normalized)
+        least_used = [
+            mode for mode in normalized
+            if self._ai_mode_counts.get(mode, 0) == minimum
+        ]
+        selected = rng.choice(least_used)
+        self._ai_mode_counts[selected] = self._ai_mode_counts.get(selected, 0) + 1
+        return selected
     
     def build(self,
               packet_class: Type[Packet],
@@ -72,6 +114,7 @@ class Framework:
             packet_class: Packet definition class (subclass of Packet)
             mode: Fuzzing mode - one of:
                 - 'clean': No fuzzing
+                - 'ai': Automatically balance all applicable fuzzing strategies
                 - 'field': Field-level mutations only
                 - 'blind': Random byte corruption
                 - 'byteflip': Targeted byte flips
@@ -81,11 +124,12 @@ class Framework:
                 - 'full': All strategies combined
             values: Runtime values dict, e.g., {'field_name': value}
                     Supports dotted paths: {'header.session_id': 123}
-            fuzz_count: Max fields to fuzz (None = auto, typically 1-5)
+            fuzz_count: Max fields to fuzz (AI default: 1; other modes: auto 1-5)
             fields: Specific field names to target (None = random selection)
             array_expand: If True, expand arrays to match fuzzed COUNT fields
             array_max: Maximum array size when expanding (default 65535)
-            byteflip_count: Number of byte flips to apply (None = auto 1-5)
+            byteflip_count: Number of byte flips to apply (AI default: 1;
+                            other modes: auto 1-5)
             seed: Reproduce one exact build, including field selection
         
         Returns:
@@ -103,6 +147,7 @@ class Framework:
             mode = FuzzMode(mode)
         elif not isinstance(mode, FuzzMode):
             raise TypeError("mode must be a FuzzMode or valid mode string")
+        requested_mode = mode
         if not (isinstance(packet_class, type) and issubclass(packet_class, Packet)):
             raise TypeError("packet_class must be a Packet subclass")
         if values is not None and not isinstance(values, dict):
@@ -132,6 +177,25 @@ class Framework:
         
         # Create packet instance with values
         packet = packet_class(copy.deepcopy(values or {}))
+
+        # AI mode balances only strategies that can do useful work for this
+        # packet. Raw modes are always applicable; structured modes require at
+        # least one eligible field. Explicit fields further constrain which
+        # structured strategies may be selected.
+        if requested_mode == FuzzMode.AI:
+            mode = self.choose_ai_mode(
+                self._applicable_ai_modes(
+                    packet,
+                    fields,
+                    fuzz_count=fuzz_count,
+                    byteflip_count=byteflip_count,
+                ),
+                rng=case_rng,
+            )
+            if fuzz_count is None:
+                fuzz_count = 1
+            if byteflip_count is None:
+                byteflip_count = 1
         
         # Pre-select fields to fuzz when fuzz_count is set but no specific fields given
         # Skip field selection for modes that only do raw byte mutations
@@ -208,6 +272,7 @@ class Framework:
             original_size=original_size,
             fuzzed_size=len(data),
             seed=case_seed,
+            requested_mode=(requested_mode if requested_mode == FuzzMode.AI else None),
         )
         
         # Print standardized output
@@ -215,6 +280,67 @@ class Framework:
             self._print_output(packet_class.__name__, info, data)
         
         return data, info
+
+    def _applicable_ai_modes(self, packet: Packet,
+                             fields: List[str] = None,
+                             fuzz_count: int = None,
+                             byteflip_count: int = None) -> List[FuzzMode]:
+        """Return strategies that can mutate this packet and field selection."""
+        explicit = fields is not None
+
+        def eligible_fields(mode: FuzzMode) -> List[str]:
+            return self._collect_fuzzable_fields(packet, mode, explicit=explicit)
+
+        def supports_requested(mode: FuzzMode) -> bool:
+            candidates = eligible_fields(mode)
+            if fields is None:
+                return bool(candidates)
+            return all(any(
+                SerializerContext._target_matches(
+                    requested, candidate, candidate.rsplit('.', 1)[-1]
+                )
+                for candidate in candidates
+            ) for requested in fields)
+
+        # Validate explicit names once against normal structured fuzzing so a
+        # typo cannot be hidden by a raw strategy selected on that round.
+        if fields is not None:
+            normal_fields = eligible_fields(FuzzMode.FIELD)
+            unknown = [
+                requested for requested in fields
+                if not any(
+                    SerializerContext._target_matches(
+                        requested, candidate, candidate.rsplit('.', 1)[-1]
+                    )
+                    for candidate in normal_fields
+                )
+            ]
+            if unknown:
+                raise ValueError(
+                    "unknown or ineligible fuzz field(s): " + ', '.join(unknown)
+                )
+
+        structured_enabled = fuzz_count != 0 and fields != []
+        byteflip_enabled = byteflip_count != 0
+
+        modes = []
+        if structured_enabled and supports_requested(FuzzMode.FIELD):
+            modes.append(FuzzMode.FIELD)
+        if structured_enabled and supports_requested(FuzzMode.LENGTH):
+            modes.append(FuzzMode.LENGTH)
+        if structured_enabled and supports_requested(FuzzMode.ARRAY):
+            modes.append(FuzzMode.ARRAY)
+        if byteflip_enabled:
+            modes.append(FuzzMode.BYTEFLIP)
+        modes.append(FuzzMode.BLIND)
+        if (structured_enabled and byteflip_enabled
+                and supports_requested(FuzzMode.COMBINED)):
+            modes.append(FuzzMode.COMBINED)
+        # FULL remains distinct when it can combine blind corruption with at
+        # least one enabled structured or byteflip component.
+        if (byteflip_enabled or (structured_enabled and supports_requested(FuzzMode.FULL))):
+            modes.append(FuzzMode.FULL)
+        return modes
     
     def build_clean(self, packet_class: Type[Packet], 
                     values: Dict[str, Any] = None) -> bytes:
@@ -398,7 +524,10 @@ class Framework:
         print()
         print(f"{CYAN}{'='*70}{RESET}")
         print(f"{CYAN}[OffByWon]{RESET} {BOLD}PACKET #{self.packet_count}{RESET}")
-        print(f"Type: {YELLOW}{packet_name}{RESET} | Mode: {GREEN}{info.mode.value}{RESET}")
+        mode_label = info.mode.value
+        if info.requested_mode == FuzzMode.AI:
+            mode_label = f"ai -> {mode_label}"
+        print(f"Type: {YELLOW}{packet_name}{RESET} | Mode: {GREEN}{mode_label}{RESET}")
         print(f"{CYAN}{'='*70}{RESET}")
         
         if info.mutations:

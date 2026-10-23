@@ -80,6 +80,7 @@ class FieldType(Enum):
 class FuzzMode(Enum):
     """Fuzzing mode enumeration."""
     CLEAN = 'clean'           # No fuzzing
+    AI = 'ai'                 # Coverage-balanced automatic strategy selection
     FIELD = 'field'           # Field-level mutations only
     BLIND = 'blind'           # Random byte corruption
     BYTEFLIP = 'byteflip'     # Targeted byte flips post-serialization
@@ -266,6 +267,9 @@ class FuzzInfo:
     # Seed for this individual build. Passing it back to Framework.build(seed=...)
     # reproduces the same field selection and mutations.
     seed: Optional[int] = None
+    # AI mode resolves to one concrete mode for each build. ``mode`` records
+    # that concrete mode while ``requested_mode`` records the original request.
+    requested_mode: Optional[FuzzMode] = None
 
 
 # =============================================================================

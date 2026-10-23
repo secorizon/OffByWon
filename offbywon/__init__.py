@@ -20,7 +20,7 @@ Quick Start:
 Features:
     - Declarative packet definitions with Field types
     - Automatic length/count/offset resolution
-    - Multiple fuzzing modes (field, blind, byteflip, combined, length, array, full)
+    - Multiple fuzzing modes (ai, field, blind, byteflip, combined, length, array, full)
     - DER/ASN.1 support for authentication protocols
     - Type-specific boundary value sets and structured integer mutations
     - Standardized output formatting
