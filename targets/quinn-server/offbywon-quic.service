@@ -1,0 +1,27 @@
+[Unit]
+Description=OffByWon QUIC fuzzing target (Quinn)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/offbywon-quic-server
+Environment=OFFBYWON_QUIC_BIND=0.0.0.0:4433
+Environment=OFFBYWON_QUIC_STATE_DIR=%h/offbywon-quic-server/state
+Environment=OFFBYWON_QUIC_MAX_CONNECTIONS=1024
+ExecStart=%h/offbywon-quic-server/target/release/offbywon-quic-server serve
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/offbywon-quic-server/state
+MemoryMax=512M
+TasksMax=512
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target
