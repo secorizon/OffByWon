@@ -410,7 +410,7 @@ class QUICInitialFuzzer:
         self.fuzz_targets: List[str] = ['all']
         self.fuzz_mode: str = 'field'
         self.fuzz_count: Optional[int] = None
-        self.byteflip_count: Optional[int] = None
+        self.byteflip_count: int = 1
         self.blind_mode: bool = False
         self.combined_mode: bool = False
         self.byteflip_mode: bool = False
@@ -469,13 +469,13 @@ class QUICInitialFuzzer:
         print(f"{CYAN}{'='*70}{RESET}")
 
         if self._current_mutations:
-            print(f"{BOLD}Mutations:{RESET}")
+            print(f"{BOLD}Structured mutations:{RESET}")
             for field, orig, fuzzed, strategy in self._current_mutations:
                 print(f"  {GREEN}->{RESET} {field}: {DIM}{self._format_value(orig)}{RESET}"
                       f" -> {YELLOW}{self._format_value(fuzzed)}{RESET} ({strategy})")
 
         if self._current_byteflips:
-            print(f"{BOLD}Byteflip:{RESET} {len(self._current_byteflips)} mutations")
+            print(f"{BOLD}Byteflips:{RESET} {len(self._current_byteflips)}")
             for offset, orig, fuzzed in self._current_byteflips[:5]:
                 print(f"  {GREEN}->{RESET} offset {offset}: {DIM}0x{orig:02x}{RESET} -> {YELLOW}0x{fuzzed:02x}{RESET}")
             if len(self._current_byteflips) > 5:
@@ -1115,9 +1115,12 @@ Examples:
         fg.add_argument("--fuzz-target", default="all",
                         choices=self.get_available_targets() + ['all'],
                         help=f"Target: {', '.join(self.get_available_targets())} or 'all'")
-        fg.add_argument("--fuzz-count", type=int, default=None, help="Max fields per packet")
+        fg.add_argument(
+            "--fuzz-count", type=int, default=None,
+            help="Maximum structured fields per packet",
+        )
         fg.add_argument("--byteflip-count", type=int, default=None,
-                        help="Final-datagram byteflips (default: random 1-5)")
+                        help="Final-datagram byteflips (default: --fuzz-count when set, otherwise 1)")
         fg.add_argument("--blind", action="store_true", help="Blind datagram corruption")
         fg.add_argument("--combined", action="store_true",
                         help="Structured fuzzing plus final-datagram byteflips")
@@ -1165,7 +1168,12 @@ Examples:
         self.fuzzing = p.fuzz
         self.fuzz_targets = [p.fuzz_target] if p.fuzz_target != 'all' else ['all']
         self.fuzz_count = p.fuzz_count
-        self.byteflip_count = p.byteflip_count
+        if p.byteflip_count is not None:
+            self.byteflip_count = p.byteflip_count
+        elif p.fuzz_count is not None:
+            self.byteflip_count = p.fuzz_count
+        else:
+            self.byteflip_count = 1
         self.blind_mode = p.blind
         self.combined_mode = p.combined
         self.byteflip_mode = p.byteflip
@@ -1264,6 +1272,11 @@ Examples:
         print(f"[*] ALPN:       {self.alpn.decode(errors='replace')}  SNI: {self.server_name}")
         print(f"[*] Mode:       {self.fuzz_mode}")
         print(f"[*] Targets:    {', '.join(self.fuzz_targets)}")
+        if self.fuzz_mode in ('field', 'length', 'combined', 'full'):
+            structured_count = self.fuzz_count if self.fuzz_count is not None else 'auto (1-5)'
+            print(f"[*] Structured: {structured_count} field(s) per packet")
+        if self.fuzz_mode in ('byteflip', 'combined', 'full'):
+            print(f"[*] Byteflips:  {self.byteflip_count} per packet")
         print(f"[*] Iterations: {'infinite (Ctrl+C to stop)' if self.iterations is None else self.iterations}")
         print()
 

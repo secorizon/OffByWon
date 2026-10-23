@@ -102,6 +102,34 @@ def test_cli_parses_independent_mutation_counts():
     assert fuzzer.byteflip_count == 2
 
 
+def test_cli_fuzz_count_is_default_byteflip_cap_for_combined_mode():
+    fuzzer = QUICInitialFuzzer()
+    fuzzer.parse_arguments([
+        "-s", "127.0.0.1",
+        "--combined",
+        "--fuzz-count", "1",
+    ])
+
+    assert fuzzer.fuzz_count == 1
+    assert fuzzer.byteflip_count == 1
+
+    fuzzer.build_packet(fuzz_target="tls", mode="combined")
+
+    assert len(fuzzer._current_mutations) == 1
+    assert len(fuzzer._current_byteflips) == 1
+
+
+def test_cli_combined_mode_defaults_to_one_byteflip():
+    fuzzer = QUICInitialFuzzer()
+    fuzzer.parse_arguments([
+        "-s", "127.0.0.1",
+        "--combined",
+    ])
+
+    assert fuzzer.fuzz_count is None
+    assert fuzzer.byteflip_count == 1
+
+
 @pytest.mark.parametrize("option", ["--fuzz-count", "--byteflip-count"])
 def test_cli_rejects_negative_mutation_counts(option):
     with pytest.raises(SystemExit):
